@@ -1,0 +1,194 @@
+#git config --global http.sslVerify false
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: infra-devops
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: database-credentials
+  namespace: infra-devops
+type: Opaque
+stringData:
+  database-user: db_admin_user
+  database-password: VaultSecurePassword2026!
+  database-name: gitea_prod
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: infra-devops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-gitea
+  namespace: infra-devops
+  labels:
+    app: postgres-gitea
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-gitea
+  template:
+    metadata:
+      labels:
+        app: postgres-gitea
+    spec:
+      containers:
+        - name: postgresql
+          image: postgres:15-alpine
+          ports:
+            - containerPort: 5432
+              name: dbport
+          env:
+            # FIX 1: Overwrites Postgres' internal lock directory to an unprivileged writable path
+            - name: PGSOCKET
+              value: /tmp
+            # FIX 2: Tells the entrypoint script to completely skip its strict root user/group verification loops
+            - name: PGUSER
+              value: postgres
+            # FIX 3: Shifts initialization processes deeper into a clean subfolder where it skips parent chmod checks
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: database-credentials
+                  key: database-user
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: database-credentials
+                  key: database-password
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: database-credentials
+                  key: database-name
+          volumeMounts:
+            - mountPath: /var/lib/postgresql/data
+              name: postgres-storage
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-gitea-svc
+  namespace: infra-devops
+spec:
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    app: postgres-gitea
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gitea-prod-pvc
+  namespace: infra-devops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitea
+  namespace: infra-devops
+  labels:
+    app: gitea
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gitea
+  template:
+    metadata:
+      labels:
+        app: gitea
+    spec:
+      containers:
+        - name: gitea
+          image: gitea/gitea:1.22-rootless
+          ports:
+            - containerPort: 3000
+              name: http
+            - containerPort: 2222
+              name: ssh
+          env:
+            # FIX: Force Gitea to store its runtime config where it has write permissions
+            - name: GITEA_APP_INI
+              value: /var/lib/gitea/gitea/conf/app.ini
+            - name: GITEA_CUSTOM
+              value: /var/lib/gitea/gitea
+            - name: GITEA__database__DB_TYPE
+              value: postgres
+            - name: GITEA__database__HOST
+              value: postgres-gitea-svc.infra-devops.svc.cluster.local:5432
+            - name: GITEA__database__NAME
+              valueFrom:
+                secretKeyRef:
+                  name: database-credentials
+                  key: database-name
+            - name: GITEA__database__USER
+              valueFrom:
+                secretKeyRef:
+                  name: database-credentials
+                  key: database-user
+            - name: GITEA__database__PASSWD
+              valueFrom:
+                secretKeyRef:
+                  name: database-credentials
+                  key: database-password
+          volumeMounts:
+            - mountPath: /var/lib/gitea
+              name: gitea-storage
+      volumes:
+        - name: gitea-storage
+          persistentVolumeClaim:
+            claimName: gitea-prod-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitea
+  namespace: infra-devops
+spec:
+  ports:
+    - port: 3000
+      targetPort: 3000
+      name: http
+  selector:
+    app: gitea
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: gitea-secure-route
+  namespace: infra-devops
+spec:
+  to:
+    kind: Service
+    name: gitea
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

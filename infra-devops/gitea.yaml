@@ -1,0 +1,135 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitea-sa
+  namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitea
+  namespace: default
+  labels:
+    app: gitea
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gitea
+  template:
+    metadata:
+      labels:
+        app: gitea
+    spec:
+      serviceAccountName: gitea-sa
+      containers:
+        - name: gitea
+          image: gitea/gitea:1.21.4
+          ports:
+            - containerPort: 3000
+              name: http
+            - containerPort: 22
+              name: ssh
+          volumeMounts:
+            - mountPath: /data
+              name: gitea-data
+      volumes:
+        - name: gitea-data
+          # Swapped to emptyDir to bypass default namespace storage permission checks
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitea
+  namespace: default
+spec:
+  ports:
+    - port: 3000
+      targetPort: 3000
+      name: http
+    - port: 22
+      targetPort: 22
+      name: ssh
+  selector:
+    app: gitea
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: gitea
+  namespace: default
+spec:
+  to:
+    kind: Service
+    name: gitea
+  port:
+    targetPort: http
+---
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: test-app-stream
+  namespace: default
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: local-webhook-secret
+  namespace: default
+type: Opaque
+stringData:
+  WebHookSecretKey: LocalTesting123!
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: local-triggered-build
+  namespace: default
+spec:
+  source:
+    type: Git
+    git:
+      # Updated DNS pointing directly to gitea in the default namespace
+      uri: http://cluster.local
+      ref: main
+  strategy:
+    type: SourceToImage
+    sourceStrategy:
+      from:
+        kind: ImageStreamTag
+        name: 'nodejs:18-ubi8'
+        namespace: openshift
+  output:
+    to:
+      kind: ImageStreamTag
+      name: 'test-app-stream:latest'
+  triggers:
+    - type: Generic
+      generic:
+        secretReference:
+          name: local-webhook-secret
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-app-deployment
+  namespace: default
+  annotations:
+    image.openshift.io/triggers: '[{"from":{"kind":"ImageStreamTag","name":"test-app-stream:latest"},"fieldPath":"spec.template.spec.containers[?(@.name==\"web-app\")].image"}]'
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-app
+  template:
+    metadata:
+      labels:
+        app: test-app
+    spec:
+      containers:
+        - name: web-app
+          image: 'image-registry.openshift-image-registry.svc:5000/openshift/nodejs:18-ubi8'
+          ports:
+            - containerPort: 8080
